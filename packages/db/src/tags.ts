@@ -46,6 +46,38 @@ export async function createTag(
     .first<Tag>())!;
 }
 
+export interface UpdateTagInput {
+  name?: string;
+  color?: string;
+}
+
+export async function updateTag(
+  db: D1Database,
+  id: string,
+  input: UpdateTagInput,
+): Promise<Tag | null> {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (input.name !== undefined) {
+    fields.push('name = ?');
+    values.push(input.name);
+  }
+  if (input.color !== undefined) {
+    fields.push('color = ?');
+    values.push(input.color);
+  }
+  if (fields.length === 0) return db.prepare(`SELECT * FROM tags WHERE id = ?`).bind(id).first<Tag>();
+
+  values.push(id);
+  await db
+    .prepare(`UPDATE tags SET ${fields.join(', ')} WHERE id = ?`)
+    .bind(...values)
+    .run();
+
+  return db.prepare(`SELECT * FROM tags WHERE id = ?`).bind(id).first<Tag>();
+}
+
 export async function deleteTag(db: D1Database, id: string): Promise<void> {
   await db.prepare(`DELETE FROM tags WHERE id = ?`).bind(id).run();
 }

@@ -146,36 +146,20 @@ export async function upsertFriend(
   input: UpsertFriendInput,
 ): Promise<Friend> {
   const now = jstNow();
-  const existing = await getFriendByLineUserId(db, input.lineUserId);
-
-  if (existing) {
-    await db
-      .prepare(
-        `UPDATE friends
-         SET display_name = ?,
-             picture_url = ?,
-             status_message = ?,
-             is_following = 1,
-             updated_at = ?
-         WHERE line_user_id = ?`,
-      )
-      .bind(
-        'displayName' in input ? (input.displayName ?? null) : existing.display_name,
-        'pictureUrl' in input ? (input.pictureUrl ?? null) : existing.picture_url,
-        'statusMessage' in input ? (input.statusMessage ?? null) : existing.status_message,
-        now,
-        input.lineUserId,
-      )
-      .run();
-
-    return (await getFriendByLineUserId(db, input.lineUserId))!;
-  }
-
   const id = crypto.randomUUID();
+
+  // Atomic upsert: INSERT new friend, or update profile fields on duplicate line_user_id.
+  // Eliminates the SELECT→INSERT race condition when LINE delivers duplicate follow webhooks.
   await db
     .prepare(
       `INSERT INTO friends (id, line_user_id, display_name, picture_url, status_message, is_following, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+       ON CONFLICT(line_user_id) DO UPDATE SET
+         display_name   = excluded.display_name,
+         picture_url    = excluded.picture_url,
+         status_message = excluded.status_message,
+         is_following   = 1,
+         updated_at     = excluded.updated_at`,
     )
     .bind(
       id,
@@ -188,7 +172,7 @@ export async function upsertFriend(
     )
     .run();
 
-  return (await getFriendById(db, id))!;
+  return (await getFriendByLineUserId(db, input.lineUserId))!;
 }
 
 export async function updateFriendFollowStatus(

@@ -60,14 +60,46 @@ export type ScenarioWithStepCount = Scenario & { step_count: number };
 export async function getScenarios(db: D1Database): Promise<ScenarioWithStepCount[]> {
   const result = await db
     .prepare(
-      `SELECT s.*, COUNT(ss.id) as step_count
+      `SELECT s.id, s.name, s.description, s.trigger_type, s.trigger_tag_id,
+              s.line_account_id, s.is_active, s.delivery_mode, s.created_at, s.updated_at,
+              (SELECT COUNT(*) FROM scenario_steps WHERE scenario_id = s.id) AS step_count
        FROM scenarios s
-       LEFT JOIN scenario_steps ss ON s.id = ss.scenario_id
-       GROUP BY s.id
        ORDER BY s.created_at DESC`,
     )
     .all<ScenarioWithStepCount>();
-  return result.results;
+  return result.results ?? [];
+}
+
+export async function getActiveFriendAddScenarios(
+  db: D1Database,
+  lineAccountId?: string | null,
+): Promise<ScenarioWithStepCount[]> {
+  const result = lineAccountId
+    ? await db
+        .prepare(
+          `SELECT s.id, s.name, s.description, s.trigger_type, s.trigger_tag_id,
+                  s.line_account_id, s.is_active, s.delivery_mode, s.created_at, s.updated_at,
+                  (SELECT COUNT(*) FROM scenario_steps WHERE scenario_id = s.id) AS step_count
+           FROM scenarios s
+           WHERE s.is_active = 1
+             AND s.trigger_type = 'friend_add'
+             AND (s.line_account_id IS NULL OR s.line_account_id = ?)
+           ORDER BY s.created_at DESC`,
+        )
+        .bind(lineAccountId)
+        .all<ScenarioWithStepCount>()
+    : await db
+        .prepare(
+          `SELECT s.id, s.name, s.description, s.trigger_type, s.trigger_tag_id,
+                  s.line_account_id, s.is_active, s.delivery_mode, s.created_at, s.updated_at,
+                  (SELECT COUNT(*) FROM scenario_steps WHERE scenario_id = s.id) AS step_count
+           FROM scenarios s
+           WHERE s.is_active = 1
+             AND s.trigger_type = 'friend_add'
+           ORDER BY s.created_at DESC`,
+        )
+        .all<ScenarioWithStepCount>();
+  return result.results ?? [];
 }
 
 export async function getScenarioById(

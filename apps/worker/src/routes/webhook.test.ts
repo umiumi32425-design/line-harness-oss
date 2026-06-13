@@ -7,7 +7,7 @@ vi.mock('@line-crm/db', () => ({
   upsertFriend: vi.fn(),
   updateFriendFollowStatus: vi.fn(),
   getFriendByLineUserId: vi.fn(),
-  getScenarios: vi.fn(),
+  getActiveFriendAddScenarios: vi.fn().mockResolvedValue([]),
   enrollFriendInScenario: vi.fn(),
   getScenarioSteps: vi.fn(),
   advanceFriendScenario: vi.fn(),

@@ -435,7 +435,7 @@ friends.post('/api/friends/:id/tags', async (c) => {
     for (const scenario of allScenarios) {
       if (scenario.trigger_type === 'tag_added' && scenario.is_active && scenario.trigger_tag_id === body.tagId) {
         const existing = await db
-          .prepare(`SELECT id FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ?`)
+          .prepare(`SELECT id FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'`)
           .bind(friendId, scenario.id)
           .first();
         if (!existing) {

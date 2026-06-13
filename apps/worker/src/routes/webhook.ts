@@ -5,7 +5,7 @@ import {
   upsertFriend,
   updateFriendFollowStatus,
   getFriendByLineUserId,
-  getScenarios,
+  getActiveFriendAddScenarios,
   enrollFriendInScenario,
   getScenarioSteps,
   advanceFriendScenario,
@@ -205,11 +205,9 @@ async function handleEvent(
 
     // friend_add シナリオに登録（このアカウントのシナリオのみ）
     // Skip entirely when a referral link explicitly overrides (run_account_friend_add_scenarios=0).
-    const scenarios = runAccountScenarios ? await getScenarios(db) : [];
+    // getActiveFriendAddScenarios filters is_active=1, trigger_type='friend_add', and account in SQL.
+    const scenarios = runAccountScenarios ? await getActiveFriendAddScenarios(db, lineAccountId) : [];
     for (const scenario of scenarios) {
-      // Only trigger scenarios belonging to this account (or unassigned for backward compat)
-      const scenarioAccountMatch = !scenario.line_account_id || !lineAccountId || scenario.line_account_id === lineAccountId;
-      if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
         try {
           // INSERT OR IGNORE handles dedup via UNIQUE(friend_id, scenario_id)
           const friendScenario = await enrollFriendInScenario(db, friend.id, scenario.id);
@@ -289,7 +287,6 @@ async function handleEvent(
         } catch (err) {
           console.error('Failed to enroll friend in scenario', scenario.id, err);
         }
-      }
     }
 
     // Referral link side-effects (intro push + dedicated scenario)
@@ -320,7 +317,7 @@ async function handleEvent(
     }
 
     // イベントバス発火: friend_add（replyToken は Step 0 で使用済みの可能性あり）
-    await fireEvent(db, 'friend_add', { friendId: friend.id, eventData: { displayName: friend.display_name } }, lineAccessToken, lineAccountId);
+    await fireEvent(db, 'friend_add', { friendId: friend.id, eventData: { displayName: friend.display_name, refCode: friendRefCode ?? null } }, lineAccessToken, lineAccountId);
     return;
   }
 

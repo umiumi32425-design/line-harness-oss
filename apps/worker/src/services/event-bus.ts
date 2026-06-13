@@ -17,6 +17,7 @@ import {
   addTagToFriend,
   removeTagFromFriend,
   enrollFriendInScenario,
+  getScenarios,
   jstNow,
   getFriendScore,
 } from '@line-crm/db';
@@ -219,6 +220,12 @@ function matchConditions(
     }
   }
 
+  // refCode チェック（friend_add イベント用、完全一致）
+  if (typeof conditions.refCode === 'string') {
+    const refCode = typeof payload.eventData?.refCode === 'string' ? payload.eventData.refCode : null;
+    if (refCode !== conditions.refCode) return false;
+  }
+
   return true;
 }
 
@@ -236,9 +243,27 @@ async function executeAction(
   }
 
   switch (action.type) {
-    case 'add_tag':
+    case 'add_tag': {
       await addTagToFriend(db, friendId!, action.params.tagId);
+      // tag_added シナリオへの自動登録（friends.ts POST /api/friends/:id/tags と同一ロジック）
+      const allScenarios = await getScenarios(db);
+      for (const scenario of allScenarios) {
+        if (
+          scenario.trigger_type === 'tag_added' &&
+          scenario.is_active === 1 &&
+          scenario.trigger_tag_id === action.params.tagId
+        ) {
+          const existing = await db
+            .prepare(`SELECT id FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'`)
+            .bind(friendId!, scenario.id)
+            .first();
+          if (!existing) {
+            await enrollFriendInScenario(db, friendId!, scenario.id);
+          }
+        }
+      }
       break;
+    }
 
     case 'remove_tag':
       await removeTagFromFriend(db, friendId!, action.params.tagId);

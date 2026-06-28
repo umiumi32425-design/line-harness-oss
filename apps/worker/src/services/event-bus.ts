@@ -20,10 +20,17 @@ import {
   getScenarios,
   jstNow,
   getFriendScore,
+  getScenarioSteps,
+  claimFriendScenarioForDelivery,
+  advanceFriendScenario,
+  completeFriendScenario,
+  computeNextDeliveryAt,
+  resolveStepContent,
 } from '@line-crm/db';
 import { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
 import { sendAdConversions } from './ad-conversion.js';
+import { buildMessage, expandVariables, resolveMetadata, messageToLogPayload } from './step-delivery.js';
 
 export interface EventPayload {
   friendId?: string;
@@ -245,20 +252,159 @@ async function executeAction(
   switch (action.type) {
     case 'add_tag': {
       await addTagToFriend(db, friendId!, action.params.tagId);
-      // tag_added シナリオへの自動登録（friends.ts POST /api/friends/:id/tags と同一ロジック）
-      const allScenarios = await getScenarios(db);
-      for (const scenario of allScenarios) {
-        if (
-          scenario.trigger_type === 'tag_added' &&
-          scenario.is_active === 1 &&
-          scenario.trigger_tag_id === action.params.tagId
-        ) {
-          const existing = await db
-            .prepare(`SELECT id FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'`)
-            .bind(friendId!, scenario.id)
-            .first();
-          if (!existing) {
-            await enrollFriendInScenario(db, friendId!, scenario.id);
+      if (lineAccessToken && lineAccountId) {
+        const friend = await db
+          .prepare('SELECT id, line_user_id, user_id, display_name, metadata FROM friends WHERE id = ?')
+          .bind(friendId!)
+          .first<{ id: string; line_user_id: string; user_id: string | null; display_name: string | null; metadata: string | null }>();
+        if (friend) {
+          const lineClient = new LineClient(lineAccessToken);
+          const allScenarios = await getScenarios(db);
+          for (const scenario of allScenarios) {
+            if (
+              scenario.trigger_type === 'tag_added' &&
+              scenario.is_active === 1 &&
+              scenario.trigger_tag_id === action.params.tagId
+            ) {
+              try {
+                const existing = await db
+                  .prepare(`SELECT id FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'`)
+                  .bind(friend.id, scenario.id)
+                  .first();
+                if (existing) continue;
+
+                const friendScenario = await enrollFriendInScenario(db, friend.id, scenario.id);
+                if (!friendScenario) continue;
+
+                const steps = await getScenarioSteps(db, scenario.id);
+                const firstStep = steps[0];
+                if (!firstStep) continue;
+                const deliveryMode = scenario.delivery_mode ?? 'relative';
+                const now = new Date(Date.now() + 9 * 60 * 60_000);
+                const firstScheduledAt = computeNextDeliveryAt(
+                  { delivery_mode: deliveryMode },
+                  firstStep,
+                  { enrolledAt: now, previousDeliveredAt: now, now },
+                );
+                const shouldSendImmediately =
+                  firstScheduledAt !== null &&
+                  firstScheduledAt.getTime() <= now.getTime();
+                if (!shouldSendImmediately) continue;
+
+                // 排他ロック：Cronとの競合防止
+                const claimed = await claimFriendScenarioForDelivery(db, friendScenario.id, firstStep.step_order);
+                if (!claimed) continue;
+
+                try {
+                  const { resolveMetadata, buildMessage, expandVariables, messageToLogPayload } =
+                    await import('./step-delivery.js');
+                  const resolved = await resolveStepContent(db, firstStep);
+                  const resolvedMeta = await resolveMetadata(db, {
+                    user_id: friend.user_id,
+                    metadata: friend.metadata,
+                  });
+                  const expandedContent = expandVariables(
+                    resolved.messageContent,
+                    { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1],
+                  );
+                  const message = buildMessage(resolved.messageType, expandedContent);
+
+                  let deliveryType: 'reply' | 'push' = 'push';
+                  if (payload.replyToken) {
+                    try {
+                      await lineClient.replyMessage(payload.replyToken, [message]);
+                      payload.replyToken = undefined;
+                      deliveryType = 'reply';
+                    } catch (err: unknown) {
+                      const errMsg = err instanceof Error ? err.message : String(err);
+                      if (errMsg.includes('400') || errMsg.includes('Invalid reply token')) {
+                        await lineClient.pushMessage(friend.line_user_id, [message]);
+                      } else {
+                        throw err;
+                      }
+                    }
+                  } else {
+                    await lineClient.pushMessage(friend.line_user_id, [message]);
+                  }
+                  console.log(`[add_tag] Immediate delivery: step ${firstStep.id} → ${friend.line_user_id}`);
+
+                  // messages_log は独立したtry/catchで囲む（失敗してもadvance/completeは必ず実行）
+                  try {
+                    const logPayload = messageToLogPayload(message);
+                    await db
+                      .prepare(
+                        `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, source, template_id_at_send, created_at)
+                         VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, ?, 'scenario', ?, ?)`,
+                      )
+                      .bind(
+                        crypto.randomUUID(),
+                        friend.id,
+                        logPayload.messageType,
+                        logPayload.content,
+                        firstStep.id,
+                        deliveryType,
+                        resolved.templateIdAtSend,
+                        jstNow(),
+                      )
+                      .run();
+                  } catch (logErr) {
+                    console.error('[add_tag] messages_log INSERT failed (non-fatal):', logErr);
+                  }
+
+                  // advance or complete（必ず実行）
+                  const secondStep = steps[1] ?? null;
+                  if (secondStep) {
+                    const nextDelivery = computeNextDeliveryAt(
+                      { delivery_mode: deliveryMode },
+                      secondStep,
+                      { enrolledAt: now, previousDeliveredAt: now, now },
+                    );
+                    await advanceFriendScenario(
+                      db,
+                      friendScenario.id,
+                      firstStep.step_order,
+                      nextDelivery.toISOString().slice(0, -1) + '+09:00',
+                    );
+                  } else {
+                    await completeFriendScenario(db, friendScenario.id);
+                  }
+
+                  if (firstStep.on_reach_tag_id) {
+                    try {
+                      await addTagToFriend(db, friend.id, firstStep.on_reach_tag_id);
+                    } catch (tagErr) {
+                      console.error(`[add_tag] on_reach_tag attach failed step=${firstStep.id}:`, tagErr);
+                    }
+                  }
+                } catch (deliveryErr) {
+                  console.error('[add_tag] Immediate delivery failed, releasing lock:', deliveryErr);
+                  await db
+                    .prepare(`UPDATE friend_scenarios SET status = 'active', updated_at = ? WHERE id = ?`)
+                    .bind(jstNow(), friendScenario.id)
+                    .run();
+                }
+              } catch (err) {
+                console.error('[add_tag] scenario enrollment error:', err);
+              }
+            }
+          }
+        }
+      } else {
+        // lineAccessTokenなし（管理画面手動操作等）はenrollのみ
+        const allScenarios = await getScenarios(db);
+        for (const scenario of allScenarios) {
+          if (
+            scenario.trigger_type === 'tag_added' &&
+            scenario.is_active === 1 &&
+            scenario.trigger_tag_id === action.params.tagId
+          ) {
+            const existing = await db
+              .prepare(`SELECT id FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'`)
+              .bind(friendId!, scenario.id)
+              .first();
+            if (!existing) {
+              await enrollFriendInScenario(db, friendId!, scenario.id);
+            }
           }
         }
       }

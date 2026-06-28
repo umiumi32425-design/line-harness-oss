@@ -292,7 +292,10 @@ async function executeAction(
                 if (!shouldSendImmediately) continue;
 
                 // 排他ロック：Cronとの競合防止
-                const claimed = await claimFriendScenarioForDelivery(db, friendScenario.id, firstStep.step_order);
+                // enrollFriendInScenario は current_step_order=-1 で初期化するため、
+                // エンロール直後の claim は -1 を渡す必要がある。
+                // firstStep.step_order を渡すと常に不一致で claim が失敗し Cron 頼みになる。
+                const claimed = await claimFriendScenarioForDelivery(db, friendScenario.id, -1);
                 if (!claimed) continue;
 
                 try {

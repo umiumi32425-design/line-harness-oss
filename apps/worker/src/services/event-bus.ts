@@ -569,6 +569,21 @@ async function executeAction(
       break;
     }
 
+    case 'update_last_contact': {
+      if (!friendId) break;
+      const existing = await db
+        .prepare('SELECT metadata FROM friends WHERE id = ?')
+        .bind(friendId)
+        .first<{ metadata: string }>();
+      const current = JSON.parse(existing?.metadata || '{}') as Record<string, unknown>;
+      const merged = { ...current, last_contact_at: jstNow() };
+      await db
+        .prepare('UPDATE friends SET metadata = ?, updated_at = ? WHERE id = ?')
+        .bind(JSON.stringify(merged), jstNow(), friendId)
+        .run();
+      break;
+    }
+
     default:
       console.warn(`未知のアクションタイプ: ${action.type}`);
   }

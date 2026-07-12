@@ -225,3 +225,96 @@ describe('fireEvent — send_message action logging', () => {
     expect(String(captured[0].binds[3])).toContain('from-template');
   });
 });
+
+describe('fireEvent — update_last_contact action', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function fakeDbWithMetadata(existingMetadata: string): {
+    db: D1Database;
+    updateCalls: unknown[][];
+  } {
+    const updateCalls: unknown[][] = [];
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind(...args: unknown[]) {
+            if (sql.includes('UPDATE friends SET metadata')) {
+              updateCalls.push(args);
+            }
+            return this;
+          },
+          async all<T>(): Promise<{ results: T[] }> {
+            return { results: [] };
+          },
+          async first<T>(): Promise<T | null> {
+            if (sql.includes('SELECT metadata FROM friends WHERE id')) {
+              return { metadata: existingMetadata } as unknown as T;
+            }
+            return null;
+          },
+          async run(): Promise<{ success: true }> {
+            return { success: true };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    return { db, updateCalls };
+  }
+
+  it('merges last_contact_at into existing metadata instead of overwriting it', async () => {
+    const db = await import('@line-crm/db');
+    (db.getActiveAutomationsByEvent as unknown as { mockResolvedValue: (v: unknown) => void }).mockResolvedValue([
+      {
+        id: '4b40513e-d39f-456c-b75d-4765e27ad146',
+        line_account_id: null,
+        conditions: JSON.stringify({ keyword_exact: '導入済み' }),
+        actions: JSON.stringify([{ type: 'update_last_contact', params: {} }]),
+      },
+    ]);
+
+    const { db: fakeDb, updateCalls } = fakeDbWithMetadata(
+      JSON.stringify({ pre_existing_key: 'should_survive_merge' }),
+    );
+
+    await fireEvent(
+      fakeDb,
+      'message_received',
+      { friendId: 'friend-1', eventData: { text: '導入済み' } },
+      'channel-token',
+      null,
+    );
+
+    expect(updateCalls).toHaveLength(1);
+    const [metadataJson, , friendId] = updateCalls[0];
+    const merged = JSON.parse(metadataJson as string);
+    expect(merged.pre_existing_key).toBe('should_survive_merge');
+    expect(merged.last_contact_at).toBe('2026-05-08T00:00:00.000+09:00');
+    expect(friendId).toBe('friend-1');
+  });
+
+  it('does not fire when keyword_exact does not match', async () => {
+    const db = await import('@line-crm/db');
+    (db.getActiveAutomationsByEvent as unknown as { mockResolvedValue: (v: unknown) => void }).mockResolvedValue([
+      {
+        id: '4b40513e-d39f-456c-b75d-4765e27ad146',
+        line_account_id: null,
+        conditions: JSON.stringify({ keyword_exact: '導入済み' }),
+        actions: JSON.stringify([{ type: 'update_last_contact', params: {} }]),
+      },
+    ]);
+
+    const { db: fakeDb, updateCalls } = fakeDbWithMetadata('{}');
+
+    await fireEvent(
+      fakeDb,
+      'message_received',
+      { friendId: 'friend-1', eventData: { text: '関係ないメッセージ' } },
+      'channel-token',
+      null,
+    );
+
+    expect(updateCalls).toHaveLength(0);
+  });
+});

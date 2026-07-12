@@ -340,6 +340,9 @@ function makeSendDb(opts: {
   selectedCounts?: Array<{ line_account_id: string; cnt: number }>;
   rankedRows?: Array<{ friend_id: string; line_user_id: string; line_account_id: string; ident_key?: string }>;
   accountMeta?: Array<{ id: string; name: string; country: string | null }>;
+  // messages_log INSERT を db.batch() 経由で失敗させる (progress 永続化が
+  // 独立して成功することを検証するためのフック)。
+  failMessagesLogBatch?: boolean;
 }) {
   const updates: Record<string, unknown> = {};
   // Per-batch progress UPDATE 履歴。resume テスト用に full snapshot を取る。
@@ -378,6 +381,9 @@ function makeSendDb(opts: {
       };
     },
     async batch(stmts: D1PreparedStatement[]) {
+      if (opts.failMessagesLogBatch) {
+        throw new Error('D1_ERROR: no such column: line_account_id');
+      }
       batches.push(stmts as unknown as unknown[]);
       return Array(stmts.length).fill({ success: true });
     },
@@ -694,5 +700,85 @@ describe('processMultiAccountDedupBroadcast', () => {
     const last = JSON.parse(progressUpdates[progressUpdates.length - 1].progress as string);
     expect(last.sentIdentKeys).toHaveLength(501);
     expect(last.sentIdentKeys[500]).toBe('f500');
+  });
+
+  it('messages_log insert fails after multicast succeeds: progress still persists, no resend on next resume', async () => {
+    // 032 未適用期間を再現: messages_log への db.batch() が失敗する状況でも、
+    // multicast は既に成功しているので dedup_progress/success_count は独立して
+    // 永続化されなければならない (さもないと resume で同じ受信者に再送される)。
+    const { db, progressUpdates } = makeSendDb({
+      selectedCounts: [{ line_account_id: 'acc1', cnt: 2 }],
+      rankedRows: [
+        { friend_id: 'f1', line_user_id: 'u1', line_account_id: 'acc1' },
+        { friend_id: 'f2', line_user_id: 'u2', line_account_id: 'acc1' },
+      ],
+      accountMeta: [{ id: 'acc1', name: 'A1', country: null }],
+      failMessagesLogBatch: true,
+    });
+
+    vi.mocked(getLineAccountById).mockImplementation(async (_db: D1Database, id: string) => {
+      if (id === 'acc1') return { id, channel_access_token: 'tok1', is_active: 1 } as never;
+      return null;
+    });
+
+    const clients: MockLineClient[] = [];
+    const factory = (token: string) => {
+      const c = new MockLineClient(token);
+      clients.push(c);
+      return c as unknown as LineClient;
+    };
+
+    const result = await processMultiAccountDedupBroadcast(
+      db,
+      {
+        id: 'b-log-fail',
+        account_ids: '["acc1"]',
+        dedup_priority: '["acc1"]',
+        message_type: 'text',
+        message_content: 'hello',
+        dedup_progress: null,
+      },
+      factory,
+    );
+
+    // multicast 自体は成功しているので failedAccountIds には入らない
+    // (messages_log 失敗は監査ログのみの問題として握り潰す設計)。
+    expect(result.failedAccountIds).toEqual([]);
+    expect(result.successCount).toBe(2);
+
+    // dedup_progress は messages_log の失敗と無関係に永続化されている。
+    expect(progressUpdates).toHaveLength(1);
+    const persisted = JSON.parse(progressUpdates[0].progress as string);
+    expect(persisted.sentIdentKeys).toEqual(['f1', 'f2']);
+    expect(progressUpdates[0].successCount).toBe(2);
+
+    // 次の resume では sentSet に f1/f2 が入っているので再送されないはず。
+    const { db: resumeDb } = makeSendDb({
+      selectedCounts: [{ line_account_id: 'acc1', cnt: 2 }],
+      rankedRows: [
+        { friend_id: 'f1', line_user_id: 'u1', line_account_id: 'acc1' },
+        { friend_id: 'f2', line_user_id: 'u2', line_account_id: 'acc1' },
+      ],
+      accountMeta: [{ id: 'acc1', name: 'A1', country: null }],
+    });
+    const resumeClients: MockLineClient[] = [];
+    const resumeFactory = (token: string) => {
+      const c = new MockLineClient(token);
+      resumeClients.push(c);
+      return c as unknown as LineClient;
+    };
+    await processMultiAccountDedupBroadcast(
+      resumeDb,
+      {
+        id: 'b-log-fail',
+        account_ids: '["acc1"]',
+        dedup_priority: '["acc1"]',
+        message_type: 'text',
+        message_content: 'hello',
+        dedup_progress: JSON.stringify({ sentIdentKeys: persisted.sentIdentKeys }),
+      },
+      resumeFactory,
+    );
+    expect(resumeClients[0]?.calls.length ?? 0).toBe(0);
   });
 });

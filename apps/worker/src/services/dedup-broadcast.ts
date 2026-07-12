@@ -258,6 +258,39 @@ function parseProgress(raw: string | null | undefined): DedupProgress {
   return empty;
 }
 
+const PROGRESS_PERSIST_RETRIES = 3;
+const PROGRESS_PERSIST_RETRY_DELAY_MS = 200;
+
+/**
+ * dedup_progress/success_count の UPDATE を、messages_log とは独立に確実に永続化する。
+ * multicast 成功直後に呼ばれる — この UPDATE が失敗し続けると resume 時に同一
+ * バッチが再送され実害のある二重配信になるため、一時的な D1 エラーを想定して
+ * 数回リトライする。それでも失敗したら呼び出し元 (batch ループ) に例外を投げ、
+ * そのアカウントの残りバッチを止めさせる (安全側に倒す)。
+ */
+async function persistProgressWithRetry(
+  db: D1Database,
+  broadcastId: string,
+  progress: DedupProgress,
+): Promise<void> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < PROGRESS_PERSIST_RETRIES; attempt++) {
+    try {
+      // success_count は absolute (`= ?`) で書いて double-counting を防ぐ。
+      await db.prepare(
+        `UPDATE broadcasts SET dedup_progress = ?, success_count = ? WHERE id = ?`,
+      ).bind(JSON.stringify(progress), progress.sentIdentKeys.length, broadcastId).run();
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < PROGRESS_PERSIST_RETRIES - 1) {
+        await sleep(PROGRESS_PERSIST_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 export async function processMultiAccountDedupBroadcast(
   db: D1Database,
   broadcast: {
@@ -363,24 +396,37 @@ export async function processMultiAccountDedupBroadcast(
         }
 
         const now = jstNow();
-        // messages_log INSERT と progress UPDATE を 1 batch にまとめてアトミックに
-        // 永続化する。Worker が multicast 後・batch 完了前に死ぬと「LINE 配信済 +
-        // DB 進捗未更新」になって resume 時に同 batch を再送 → 重複配信事故が起きる。
-        // db.batch は D1 で transaction として扱われ、まとめて成否が決まる。
-        const stmts = [
-          ...batch.map((r) =>
-            db.prepare(
-              `INSERT INTO messages_log
-                (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
-               VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?, ?)`,
-            ).bind(crypto.randomUUID(), r.friendId, broadcast.message_type, broadcast.message_content, broadcast.id, account.id, now),
-          ),
-          // success_count は absolute (`= ?`) で書いて double-counting を防ぐ。
-          db.prepare(
-            `UPDATE broadcasts SET dedup_progress = ?, success_count = ? WHERE id = ?`,
-          ).bind(JSON.stringify(progress), progress.sentIdentKeys.length, broadcast.id),
-        ];
-        await db.batch(stmts);
+
+        // dedup_progress/success_count の永続化を messages_log の記録より必ず先に、
+        // かつ独立した statement で行う。multicast は既に LINE に届いており取り消せない
+        // ため、resume 時の重複送信を防ぐにはこの進捗更新こそが唯一の安全弁になる。
+        // messages_log INSERT とまとめて 1 batch (= 1 transaction) にしてしまうと、
+        // 監査ログ側の失敗 (スキーマ不整合など) が進捗更新まで巻き込んでロールバック
+        // させてしまい、multicast 成功済みのバッチが「未送信」として resume 時に
+        // 再送される事故につながる (2026-07、032 未適用期間中にこの結合が原因で
+        // 実際に起こりうることが判明。幸い本番で multi-account-dedup broadcast が
+        // 一件も実行されておらず実害はなかった)。
+        // そのため進捗更新は分離し、一時的な D1 エラーに備えて数回リトライする。
+        await persistProgressWithRetry(db, broadcast.id, progress);
+
+        // messages_log は監査目的の付随記録。ここで失敗しても進捗の正しさには
+        // 影響しないため、握り潰さずログだけ残してバッチ処理を継続する。
+        try {
+          await db.batch(
+            batch.map((r) =>
+              db.prepare(
+                `INSERT INTO messages_log
+                  (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, source, line_account_id, created_at)
+                 VALUES (?, ?, 'outgoing', ?, ?, ?, NULL, 'broadcast', ?, ?)`,
+              ).bind(crypto.randomUUID(), r.friendId, broadcast.message_type, broadcast.message_content, broadcast.id, account.id, now),
+            ),
+          );
+        } catch (err) {
+          console.error(
+            `[multi-account-dedup] messages_log insert failed for broadcast ${broadcast.id} (progress already persisted, audit trail only):`,
+            err,
+          );
+        }
       }
     } catch (err) {
       console.error(`[multi-account-dedup] account ${account.id} failed:`, err);

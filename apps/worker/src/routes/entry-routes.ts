@@ -73,6 +73,17 @@ entryRoutes.post('/api/entry-routes', async (c) => {
     const row = await createEntryRoute(c.env.DB, body);
     return c.json({ success: true, data: serialize(row) }, 201);
   } catch (err) {
+    // D1 surfaces UNIQUE/FOREIGN KEY constraint violations as thrown errors
+    // (e.g. duplicate refCode, or tagId/scenarioId pointing at a row that
+    // doesn't exist). Surface those as 409/400 instead of masking as 500 —
+    // see line-accounts.ts / traffic-pools.ts for the same pattern.
+    const message = err instanceof Error ? err.message : String(err);
+    if (/UNIQUE constraint failed/i.test(message)) {
+      return c.json({ success: false, error: 'refCode already exists' }, 409);
+    }
+    if (/FOREIGN KEY constraint failed/i.test(message)) {
+      return c.json({ success: false, error: 'tagId, scenarioId, poolId, or introTemplateId references a row that does not exist' }, 400);
+    }
     console.error('POST /api/entry-routes error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
@@ -99,6 +110,13 @@ entryRoutes.patch('/api/entry-routes/:id', async (c) => {
     if (!row) return c.json({ success: false, error: 'Not found' }, 404);
     return c.json({ success: true, data: serialize(row) });
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/UNIQUE constraint failed/i.test(message)) {
+      return c.json({ success: false, error: 'refCode already exists' }, 409);
+    }
+    if (/FOREIGN KEY constraint failed/i.test(message)) {
+      return c.json({ success: false, error: 'tagId, scenarioId, poolId, or introTemplateId references a row that does not exist' }, 400);
+    }
     console.error('PATCH /api/entry-routes/:id error:', err);
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
